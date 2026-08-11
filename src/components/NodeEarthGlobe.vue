@@ -382,7 +382,7 @@ watch(
 )
 
 watch(
-  [() => regionClusters.value.map(clusterKey).join(','), userCoord],
+  [() => regionClusters.value.map(clusterKey).join(',')],
   async () => {
     if (!globe)
       return
