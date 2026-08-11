@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -38,6 +39,7 @@ jobs:
         id: version
         env:
           BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           node <<'NODE' >> "$GITHUB_OUTPUT"
           const { execFileSync } = require('node:child_process')
@@ -45,6 +47,7 @@ jobs:
 
           const zeroSha = '0000000000000000000000000000000000000000'
           const beforeSha = process.env.BEFORE_SHA
+          const eventName = process.env.EVENT_NAME
 
           function readJson(filePath) {
             return JSON.parse(readFileSync(filePath, 'utf8'))
@@ -72,7 +75,10 @@ jobs:
           let previousVersion = ''
           let versionChanged = true
 
-          if (beforeSha && beforeSha !== zeroSha) {
+          if (eventName === 'workflow_dispatch') {
+            versionChanged = true
+          }
+          else if (beforeSha && beforeSha !== zeroSha) {
             const prev = readJsonAtRevision(beforeSha, 'package.json')
             previousVersion = prev?.version ?? ''
             versionChanged = previousVersion !== currentVersion
