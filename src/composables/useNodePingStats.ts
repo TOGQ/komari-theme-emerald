@@ -1,6 +1,11 @@
 import type { MaybeRefOrGetter } from 'vue'
+import type { PublicPingTaskOrderItem } from '@/utils/pingTaskOrder'
 import { useThrottleFn } from '@vueuse/core'
 import { computed, onScopeDispose, ref, shallowRef, toValue, watch } from 'vue'
+import {
+
+  sortTasksByPublicOrder,
+} from '@/utils/pingTaskOrder'
 import { getSharedRpc } from '@/utils/rpc'
 
 export interface NodePingHistoryPoint {
@@ -237,15 +242,30 @@ async function loadSharedPingRecords(entry: SharedPingRecordsEntry, hours: numbe
 
   entry.promise = (async () => {
     try {
-      const result = await rpc.getClient().call<SharedPingRecordsResponse>('common:getRecords', {
-        type: 'ping',
-        // 新版 getRecords 可能只返回近期可用样本，hours 仅作为服务端查询窗口。
-        hours,
-      })
+      const [result, publicTasks] = await Promise.all([
+        rpc.getClient().call<SharedPingRecordsResponse>('common:getRecords', {
+          type: 'ping',
+          // 新版 getRecords 可能只返回近期可用样本，hours 仅作为服务端查询窗口。
+          hours,
+        }),
+        // getRecords 的 tasks 不一定带 weight；用 getPublicPingTasks 对齐后台拖拽顺序
+        rpc.getClient().call<PublicPingTaskOrderItem[]>('public:getPublicPingTasks').catch(() => []),
+      ])
+
+      const publicTaskList = Array.isArray(publicTasks) ? publicTasks : []
+      const recordTasks = result?.tasks ?? []
+      const orderedTasks = publicTaskList.length
+        ? sortTasksByPublicOrder(
+            recordTasks.length
+              ? recordTasks
+              : publicTaskList.map(task => ({ id: task.id, name: task.name || `Ping ${task.id}` })),
+            publicTaskList,
+          )
+        : recordTasks
 
       entry.data.value = {
         recordsByClient: buildRecordsByClient(result?.records ?? []),
-        tasks: result?.tasks ?? [],
+        tasks: orderedTasks,
       }
       entry.lastFetchedAt = Date.now()
     }

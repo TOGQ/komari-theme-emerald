@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { PublicPingTaskOrderItem } from '@/utils/pingTaskOrder'
 import { Icon } from '@iconify/vue'
 import dayjs from 'dayjs'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
@@ -10,6 +11,10 @@ import { Spinner } from '@/components/ui/spinner'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBackgroundSurface } from '@/composables/useBackgroundSurface'
 import { useAppStore } from '@/stores/app'
+import {
+
+  sortTasksByPublicOrder,
+} from '@/utils/pingTaskOrder'
 import { cutPeakValues, interpolateNullsLinear } from '@/utils/recordHelper'
 import { getSharedRpc, RpcError } from '@/utils/rpc'
 import '@/utils/echarts' // 共享 ECharts 配置
@@ -51,12 +56,16 @@ const chartColors = [
 // 从 publicSettings 获取记录保留时间
 const maxPingRecordPreserveTime = computed(() => appStore.publicSettings?.ping_record_preserve_time || 168)
 
-// 视图选项
+// 视图选项（与 LoadChart 对齐，12 小时仅网络图有；60/90 天仅在实际保留时间足够时显示）
 const presetViews = [
   { label: '1 小时', hours: 1 },
   { label: '6 小时', hours: 6 },
   { label: '12 小时', hours: 12 },
   { label: '1 天', hours: 24 },
+  { label: '7 天', hours: 168 },
+  { label: '30 天', hours: 720 },
+  { label: '60 天', hours: 1440 },
+  { label: '90 天', hours: 2160 },
 ]
 
 // 可用视图列表
@@ -170,13 +179,21 @@ interface PingRecordsResponse {
   tasks?: TaskInfo[]
 }
 
+interface LossRecord {
+  task_id: number
+  time: string
+  loss: number
+}
+
 interface PingChartData {
   records: PingRecord[]
   tasks: TaskInfo[]
+  lossRecords?: LossRecord[]
 }
 
 // 数据状态
 const remoteData = shallowRef<PingRecord[]>([])
+const lossRecordsData = shallowRef<LossRecord[]>([])
 const tasks = shallowRef<TaskInfo[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -219,74 +236,151 @@ function getMetricTaskId(series: MetricSeries, point: MetricPoint): number | nul
   return Number.isInteger(taskId) ? taskId : null
 }
 
+// 与官方 komari-web HISTORY_MAX_POINTS 对齐；过小会导致长范围间隔过大、曲线断点过多
+const HISTORY_MAX_POINTS = 700
+
+/**
+ * 将 metrics 延迟点转为图表记录。
+ * 官方在 fill_empty=true 时会把丢包采样（latency=-1）转成 null；
+ * 这里统一用 value=-1 表示断点/丢包，供合并与丢包标记复用。
+ * 不要把 ping.loss 的聚合平均值（0~1）当成整点丢包写入延迟序列，
+ * 否则 7 天等长范围会出现大量伪断点，曲线断断续续。
+ */
+function pushLatencyMetricPoint(
+  records: PingRecord[],
+  uuid: string,
+  taskId: number,
+  point: MetricPoint,
+) {
+  if (point.value === null || point.value < 0) {
+    records.push({
+      client: uuid,
+      task_id: taskId,
+      time: point.time,
+      value: -1,
+    })
+    return
+  }
+
+  records.push({
+    client: uuid,
+    task_id: taskId,
+    time: point.time,
+    value: point.value,
+  })
+}
+
 async function fetchMetricRecords(uuid: string, hours: number): Promise<PingChartData> {
-  const [metricResult, statsResult] = await Promise.all([
+  const [metricResult, statsResult, lossResult, publicTasks] = await Promise.all([
     rpc.getClient().call<MetricQueryResponse>('public:queryMetrics', {
-      metric_keys: ['ping.latency_ms', 'ping.loss'],
+      // 与官方主题一致：延迟曲线只吃 ping.latency_ms；丢包率走 getPingMetricStats
+      metric_keys: ['ping.latency_ms'],
       entity_id: uuid,
       hours,
-      downsample: true,
-      max_points: 500,
+      max_points: HISTORY_MAX_POINTS,
       aggregation: 'avg',
+      // 官方默认开启：空桶补 null，并把 latency=-1 规范为 null
+      fill_empty: true,
     }),
     rpc.getClient().call<PingMetricStatsResponse>('public:getPingMetricStats', {
+      entity_id: uuid,
       uuid,
       hours,
-      max_points: 500,
+      max_points: HISTORY_MAX_POINTS,
     }),
+    // 超过 6 小时后延迟降采样不再含负数，独立查询 ping.loss 供丢包标记使用
+    rpc.getClient().call<MetricQueryResponse>('public:queryMetrics', {
+      metric_keys: ['ping.loss'],
+      entity_id: uuid,
+      hours,
+      max_points: HISTORY_MAX_POINTS,
+      aggregation: 'avg',
+      fill_empty: true,
+    }).catch(() => null),
+    // getPingMetricStats 按 task_id 排序，后台拖拽顺序在 weight 上；
+    // 与官方主题一致，用 getPublicPingTasks（weight ASC, id ASC）重排展示顺序
+    rpc.getClient().call<PublicPingTaskOrderItem[]>('public:getPublicPingTasks').catch(() => []),
   ])
 
   const records: PingRecord[] = []
   for (const series of metricResult?.series ?? []) {
+    if (series.metric_key !== 'ping.latency_ms')
+      continue
+
     for (const point of series.points ?? []) {
       const taskId = getMetricTaskId(series, point)
       if (taskId === null)
         continue
 
-      if (point.value === null)
-        continue
-
-      if (series.metric_key === 'ping.loss' && point.value <= 0)
-        continue
-
-      records.push({
-        client: uuid,
-        task_id: taskId,
-        time: point.time,
-        value: series.metric_key === 'ping.loss' ? -1 : point.value,
-      })
+      pushLatencyMetricPoint(records, uuid, taskId, point)
     }
   }
 
-  const metricTasks = (statsResult?.stats ?? []).map(task => ({
-    id: Number(task.task_id),
-    name: task.name || `Ping ${task.task_id}`,
-    interval: task.interval ?? 60,
-    loss: task.loss,
-    p99: task.p99,
-    p50: task.p50,
-    p99_p50_ratio: task.p99_p50_ratio,
-    min: task.min,
-    max: task.max,
-    avg: task.avg,
-    latest: task.latest,
-    total: task.total,
-    type: task.type,
-  })).filter(task => Number.isInteger(task.id))
+  const lossRecords: LossRecord[] = []
+  for (const series of lossResult?.series ?? []) {
+    if (series.metric_key !== 'ping.loss')
+      continue
 
-  return { records, tasks: metricTasks }
+    for (const point of series.points ?? []) {
+      const taskId = getMetricTaskId(series, point)
+      if (taskId !== null && point.value !== null && point.value > 0) {
+        lossRecords.push({
+          task_id: taskId,
+          time: point.time,
+          loss: point.value,
+        })
+      }
+    }
+  }
+
+  const publicTaskList = Array.isArray(publicTasks) ? publicTasks : []
+  const publicTaskNameMap = new Map(
+    publicTaskList.map(task => [task.id, task.name?.trim() || ''] as const),
+  )
+
+  const metricTasks = (statsResult?.stats ?? []).map((task) => {
+    const id = Number(task.task_id)
+    const publicName = publicTaskNameMap.get(id)
+    return {
+      id,
+      name: publicName || task.name || `Ping ${task.task_id}`,
+      interval: task.interval ?? 60,
+      loss: task.loss,
+      p99: task.p99,
+      p50: task.p50,
+      p99_p50_ratio: task.p99_p50_ratio,
+      min: task.min,
+      max: task.max,
+      avg: task.avg,
+      latest: task.latest,
+      total: task.total,
+      type: task.type,
+    }
+  }).filter(task => Number.isInteger(task.id))
+
+  return {
+    records,
+    tasks: sortTasksByPublicOrder(metricTasks, publicTaskList),
+    lossRecords,
+  }
 }
 
 async function fetchLegacyRecords(uuid: string, hours: number): Promise<PingChartData> {
-  const result = await rpc.getClient().call<PingRecordsResponse>('common:getRecords', {
-    type: 'ping',
-    uuid,
-    hours,
-  })
+  const [result, publicTasks] = await Promise.all([
+    rpc.getClient().call<PingRecordsResponse>('common:getRecords', {
+      type: 'ping',
+      uuid,
+      hours,
+    }),
+    rpc.getClient().call<PublicPingTaskOrderItem[]>('public:getPublicPingTasks').catch(() => []),
+  ])
+
+  const publicTaskList = Array.isArray(publicTasks) ? publicTasks : []
+  const legacyTasks = result?.tasks ?? []
 
   return {
     records: result?.records ?? [],
-    tasks: result?.tasks ?? [],
+    tasks: sortTasksByPublicOrder(legacyTasks, publicTaskList),
   }
 }
 
@@ -327,6 +421,7 @@ async function fetchRecords() {
     records.sort((a, b) => dayjs(a.time).valueOf() - dayjs(b.time).valueOf())
 
     remoteData.value = records
+    lossRecordsData.value = result.lossRecords ?? []
     tasks.value = result.tasks
 
     if (tasks.value.length > 0 && selectedTaskIds.value.length === 0) {
@@ -339,6 +434,7 @@ async function fetchRecords() {
 
     error.value = err instanceof Error ? err.message : '获取数据失败'
     remoteData.value = []
+    lossRecordsData.value = []
     tasks.value = []
   }
   finally {
@@ -419,10 +515,12 @@ const chartData = computed(() => {
   }
 
   if (selectedKeys.length > 0 && data.length > 0) {
+    // 长范围降采样后桶间隔会变大，按查询跨度放宽插值上限，避免 7 天+ 曲线被硬截断
+    const bucketMs = Math.ceil((selectedHours.value * 3600_000) / HISTORY_MAX_POINTS)
     data = interpolateNullsLinear(data, selectedKeys, {
       maxGapMultiplier: 6,
       minCapMs: 2 * 60_000,
-      maxCapMs: 30 * 60_000,
+      maxCapMs: Math.max(30 * 60_000, bucketMs * 6),
     })
   }
 
@@ -495,14 +593,44 @@ const packetLossMarkers = computed(() => {
   if (!data.length || !selectedTasks.value.length)
     return markers
 
+  // 长范围 fill_empty 可能产生大量空桶，限制标记数量避免 markLine 过密拖垮渲染
+  const MAX_LOSS_MARKERS_PER_TASK = 200
   const chartTimes = data.map(item => dayjs(item.time as string).valueOf())
   const toleranceMs = mergeToleranceMs.value
 
   for (const task of selectedTasks.value) {
     const points = new Set<number>()
-    const taskLossRecords = remoteData.value.filter(rec => rec.task_id === task.id && rec.value < 0)
+    // 来源 1：短周期原始探测点中延迟为 null / < 0
+    const taskLatencyLossRecords = remoteData.value.filter(rec => rec.task_id === task.id && rec.value < 0)
+    for (const record of taskLatencyLossRecords) {
+      if (points.size >= MAX_LOSS_MARKERS_PER_TASK)
+        break
 
+      const lossTs = dayjs(record.time).valueOf()
+      let matchedIndex = -1
+
+      for (let i = 0; i < chartTimes.length; i++) {
+        const chartTs = chartTimes[i]
+        if (chartTs === undefined)
+          continue
+
+        if (Math.abs(chartTs - lossTs) <= toleranceMs) {
+          matchedIndex = i
+          break
+        }
+      }
+
+      if (matchedIndex >= 0) {
+        points.add(matchedIndex)
+      }
+    }
+
+    // 来源 2：长周期聚合分桶的 ping.loss 时序数据
+    const taskLossRecords = lossRecordsData.value.filter(rec => rec.task_id === task.id && rec.loss > 0)
     for (const record of taskLossRecords) {
+      if (points.size >= MAX_LOSS_MARKERS_PER_TASK)
+        break
+
       const lossTs = dayjs(record.time).valueOf()
       let matchedIndex = -1
 
@@ -722,6 +850,7 @@ watch(selectedView, () => {
 
 watch(() => props.uuid, () => {
   remoteData.value = []
+  lossRecordsData.value = []
   tasks.value = []
   selectedTaskIds.value = []
   fetchRecords()
